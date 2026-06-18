@@ -57,9 +57,9 @@ type StageOutput = Option<JoinHandle<()>>;
 
 fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
     let context = get_application_context();
-    let temp_file = context.data_dir.join("archlinux-fs.tar.xz");
+    let temp_file = context.data_dir.join("ubuntu-fs.tar.xz");
     let fs_root = Path::new(ARCH_FS_ROOT);
-    let extracted_dir = context.data_dir.join("archlinux-aarch64");
+    let extracted_dir = context.data_dir.join("ubuntu-noble-aarch64");
     let mpsc_sender = options.mpsc_sender.clone();
 
     // Only run if the fs_root is missing or empty
@@ -72,16 +72,16 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
                 if !temp_file.exists() {
                     mpsc_sender
                         .send(SetupMessage::Progress(
-                            "Downloading Arch Linux FS...".to_string(),
+                            "Downloading Ubuntu FS...".to_string(),
                         ))
                         .expect("Failed to send log message");
 
                     let response = reqwest::blocking::get(ARCH_FS_ARCHIVE)
-                        .expect("Failed to download Arch Linux FS");
+                        .expect("Failed to download Ubuntu FS");
 
                     let total_size = response.content_length().unwrap_or(0);
                     let mut file = File::create(&temp_file)
-                        .expect("Failed to create temp file for Arch Linux FS");
+                        .expect("Failed to create temp file for Ubuntu FS");
 
                     let mut downloaded = 0u64;
                     let mut buffer = [0u8; 8192];
@@ -105,7 +105,7 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
                                 let total_mb = total_size as f64 / 1024.0 / 1024.0;
                                 mpsc_sender
                                     .send(SetupMessage::Progress(format!(
-                                        "Downloading Arch Linux FS... {}% ({:.2} MB / {:.2} MB)",
+                                        "Downloading Ubuntu FS... {}% ({:.2} MB / {:.2} MB)",
                                         percent, downloaded_mb, total_mb
                                     )))
                                     .unwrap_or(());
@@ -117,7 +117,7 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
 
                 mpsc_sender
                     .send(SetupMessage::Progress(
-                        "Extracting Arch Linux FS...".to_string(),
+                        "Extracting Ubuntu FS...".to_string(),
                     ))
                     .expect("Failed to send log message");
 
@@ -126,7 +126,7 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
 
                 // Extract tar file directly to the final destination
                 let tar_file =
-                    File::open(&temp_file).expect("Failed to open downloaded Arch Linux FS file");
+                    File::open(&temp_file).expect("Failed to open downloaded Ubuntu FS file");
                 let tar = XzDecoder::new(tar_file);
                 let mut archive = Archive::new(tar);
 
@@ -138,7 +138,7 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
 
                     mpsc_sender
                         .send(SetupMessage::Error(format!(
-                            "Failed to extract Arch Linux FS: {}. Restarting download...",
+                            "Failed to extract Ubuntu FS: {}. Restarting download...",
                             e
                         )))
                         .unwrap_or(());
