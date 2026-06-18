@@ -155,6 +155,13 @@ fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
             fs::rename(&extracted_dir, fs_root)
                 .expect("Failed to rename extracted files to final destination");
 
+            // Fix Ubuntu DNS resolution symlink
+            // Ubuntu ships /etc/resolv.conf as a symlink to systemd-resolved, which bypasses
+            // PRoot's /etc/resolv.conf interception. We replace it with a regular file.
+            let resolv_conf = fs_root.join("etc/resolv.conf");
+            let _ = fs::remove_file(&resolv_conf);
+            let _ = fs::write(&resolv_conf, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n");
+
             // Clean up the temporary file
             fs::remove_file(&temp_file).expect("Failed to remove temporary file");
         }));
