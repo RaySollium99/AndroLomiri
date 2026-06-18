@@ -81,7 +81,8 @@ fn default_check() -> String {
 }
 
 fn default_install() -> String {
-    "stdbuf -oL bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 full-upgrade && apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 install fonts-noto-core xfce4 labwc wlr-randr xwayland xdg-desktop-portal xdg-desktop-portal-gtk onboard evince pulseaudio'"
+//    "stdbuf -oL sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 full-upgrade && apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 install fonts-noto-core xfce4 labwc wlr-randr xwayland xdg-desktop-portal xdg-desktop-portal-gtk onboard evince pulseaudio'"
+    "stdbuf -oL sh -c 'cat /etc/resolv.conf; getent hosts ports.ubuntu.com; apt-get update'"
         .to_string()
 }
 /// Direct the audio stream to the server for the whole session
