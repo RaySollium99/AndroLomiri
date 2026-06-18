@@ -76,7 +76,7 @@ pub struct CommandConfig {
 }
 
 fn default_check() -> String {
-    "dpkg -s fonts-noto-core && dpkg -s xfce4-session && dpkg -s xfce4-panel && dpkg -s xfce4-settings && dpkg -s xfce4-terminal && dpkg -s thunar && dpkg -s xfdesktop && dpkg -s xfconf && dpkg -s labwc && dpkg -s wlr-randr && dpkg -s xwayland && dpkg -s xdg-desktop-portal && dpkg -s xdg-desktop-portal-gtk && dpkg -s onboard && dpkg -s evince && dpkg -s pulseaudio"
+    "dpkg -s fonts-noto-core && dpkg -s xfce4 && dpkg -s labwc && dpkg -s wlr-randr && dpkg -s xwayland && dpkg -s xdg-desktop-portal && dpkg -s xdg-desktop-portal-gtk && dpkg -s onboard && dpkg -s evince && dpkg -s pulseaudio"
         .to_string()
 }
 
