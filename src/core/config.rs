@@ -86,8 +86,8 @@ fn default_install() -> String {
 }
 /// Direct the audio stream to the server for the whole session
 fn default_launch() -> String {
-    format!("export PULSE_SERVER={PULSE_GUEST_SERVER}; XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=XFCE /usr/local/bin/startxfce4-localdesktop 2>&1")
-        .to_string()
+    format!("bash -c 'export PULSE_SERVER={PULSE_GUEST_SERVER}; XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=wayland-0 XDG_SESSION_TYPE=wayland dbus-run-session labwc > /tmp/launch.log 2>&1'")
+    .to_string()
 }
 
 impl Default for CommandConfig {
