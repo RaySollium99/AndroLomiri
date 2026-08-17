@@ -12,7 +12,7 @@ android:
     package: app.polarbear
     sdk:
       min_sdk_version: 21
-      target_sdk_version: 33
+      target_sdk_version: 35
     application:
       label: "Local Desktop"
       extract_native_libs: true # Required for proot invocations

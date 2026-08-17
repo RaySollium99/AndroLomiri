@@ -45,12 +45,12 @@ fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBacke
         .output
         .get_or_insert_with(|| {
             Output::new(
-                "Local Desktop Wayland Compositor".into(),
+                "AndroLomiri Display".into(),
                 PhysicalProperties {
                     size: size.into(),
                     subpixel: Subpixel::HorizontalRgb,
-                    make: "Local Desktop".into(),
-                    model: config::VERSION.into(),
+                    make: "AndroLomiri".into(),
+                    model: "Compositor".into(),
                 },
             )
         })

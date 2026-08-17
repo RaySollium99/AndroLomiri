@@ -26,15 +26,17 @@ pub fn launch() {
     thread::spawn(move || {
         let _guard = LaunchRunningGuard;
 
-        // Clean up potential leftover files for display :1
+        // Clean up potential leftover files from previous sessions
         ArchProcess {
-            command: "rm -f /tmp/.X1-lock".into(),
+            command: "bash -c 'rm -rf /tmp/run /tmp/dbus-* /tmp/.X*-lock /tmp/.X11-unix* /var/run/dbus/* /run/dbus/* /var/run/user/* 2>/dev/null'".into(),
             user: None,
             log: None,
         }
         .run();
+
+        // Kill dead processes that may have been left over from a previous session
         ArchProcess {
-            command: "rm -f /tmp/.X11-unix/X1".into(),
+            command: "bash -c 'killall -9 -q dbus-daemon accounts-daemon lomiri Xwayland dbus-run-session gdbus pulseaudio 2>/dev/null || true'".into(),
             user: None,
             log: None,
         }
