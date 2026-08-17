@@ -86,7 +86,7 @@ fn default_install() -> String {
     "stdbuf -oL bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 full-upgrade; apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 install gcc dpkg-dev deviceinfo-tools fonts-noto-core lomiri lomiri-desktop-session dbus-x11 mir-graphics-drivers-desktop labwc wlr-randr xdg-desktop-portal xdg-desktop-portal-gtk evince lomiri-wallpapers accountsservice'"
         .to_string()
 }
-/// Direct the desktop session to the compositor and the host PipeWire socket.
+
 fn default_launch() -> String {
     format!("export PIPEWIRE_RUNTIME_DIR={PIPEWIRE_GUEST_RUNTIME_DIR} PULSE_SERVER={PULSE_GUEST_SERVER}; /usr/local/bin/androlomiri-session")
         .to_string()
