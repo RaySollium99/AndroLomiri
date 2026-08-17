@@ -3,13 +3,17 @@ use crate::{
     android::{
         app::build::PolarBearBackend,
         backend::{
-            wayland::{Compositor, WaylandBackend},
+            wayland::{Compositor, TouchMode, WaylandBackend},
             webview::{ErrorVariant, WebviewBackend},
         },
         utils::application_context::get_application_context,
+        utils::ndk::{density_dpi, long_press_timeout_ms, scale_factor, touch_slop_px},
         utils::ndk::run_in_jvm,
     },
-    core::config::{CommandConfig, ARCH_FS_ARCHIVE, ARCH_FS_ROOT, DOCS_HOME_URL, PULSE_GUEST_SERVER},
+    core::config::{
+        CommandConfig, ARCH_FS_ARCHIVE, ARCH_FS_ROOT, DOCS_HOME_URL, PIPEWIRE_GUEST_RUNTIME_DIR,
+        PULSE_GUEST_SERVER,
+    },
 };
 use jni::objects::JObject;
 use jni::sys::_jobject;
@@ -17,14 +21,16 @@ use pathdiff::diff_paths;
 use smithay::utils::Clock;
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
+    process,
     sync::{
         mpsc::{self, Sender},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
 use winit::platform::android::activity::AndroidApp;
@@ -55,11 +61,24 @@ type SetupStage = Box<dyn Fn(&SetupOptions) -> StageOutput + Send>;
 /// - Simple/light tasks or important settings that must be run every launch (e.g. the Firefox config) can be done inline on the `None` path.
 type StageOutput = Option<JoinHandle<()>>;
 
+const PIPEWIRE_GUEST_LOCK_PACKAGES: &[&str] = &[
+    "libpipewire",
+    "pipewire",
+    "pipewire-alsa",
+    "pipewire-audio",
+    "pipewire-jack",
+    "pipewire-pulse",
+    "pipewire-v4l2",
+    "pipewire-zeroconf",
+    "gst-plugin-pipewire",
+    "wireplumber",
+];
+
 fn setup_arch_fs(options: &SetupOptions) -> StageOutput {
     let context = get_application_context();
     let temp_file = context.data_dir.join("ubuntu-fs.tar.xz");
     let fs_root = Path::new(ARCH_FS_ROOT);
-    let extracted_dir = context.data_dir.join("ubuntu-noble-aarch64");
+    let extracted_dir = context.data_dir.join("ubuntu-resolute-aarch64");
     let mpsc_sender = options.mpsc_sender.clone();
 
     // Only run if the fs_root is missing or empty
@@ -219,6 +238,60 @@ fn simulate_linux_sysdata_stage(options: &SetupOptions) -> StageOutput {
     None
 }
 
+fn setup_machine_id(_: &SetupOptions) -> StageOutput {
+    let fs_root = Path::new(ARCH_FS_ROOT);
+    let machine_id = fs_root.join("etc/machine-id");
+
+    let existing = fs::read_to_string(&machine_id).unwrap_or_default();
+    if !is_valid_machine_id(&existing) {
+        if let Some(parent) = machine_id.parent() {
+            fs::create_dir_all(parent).expect("Failed to create /etc for machine-id");
+        }
+
+        let _ = fs::set_permissions(&machine_id, fs::Permissions::from_mode(0o644));
+        fs::write(&machine_id, format!("{}\n", generate_machine_id()))
+            .expect("Failed to write machine-id");
+        let _ = fs::set_permissions(&machine_id, fs::Permissions::from_mode(0o444));
+        log::info!("Seeded guest /etc/machine-id");
+    }
+
+    let dbus_dir = fs_root.join("var/lib/dbus");
+    fs::create_dir_all(&dbus_dir).expect("Failed to create /var/lib/dbus");
+    let dbus_machine_id = dbus_dir.join("machine-id");
+    match fs::symlink_metadata(&dbus_machine_id) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            symlink("/etc/machine-id", &dbus_machine_id)
+                .expect("Failed to symlink /var/lib/dbus/machine-id");
+        }
+        Err(err) => panic!("Failed to inspect /var/lib/dbus/machine-id: {}", err),
+    }
+
+    None
+}
+
+fn is_valid_machine_id(value: &str) -> bool {
+    let value = value.trim();
+    value.len() == 32
+        && value.chars().all(|c| c.is_ascii_hexdigit())
+        && value.chars().any(|c| c != '0')
+}
+
+fn generate_machine_id() -> String {
+    if let Ok(uuid) = fs::read_to_string("/proc/sys/kernel/random/uuid") {
+        let id = uuid.trim().replace('-', "").to_ascii_lowercase();
+        if is_valid_machine_id(&id) {
+            return id;
+        }
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{:016x}{:016x}", nanos as u64, process::id() as u64)
+}
+
 fn install_dependencies(options: &SetupOptions) -> StageOutput {
     let SetupOptions {
         mpsc_sender,
@@ -246,6 +319,8 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
     if installed() {
         return None;
     }
+
+    clear_pipewire_package_lock_for_install();
 
     let mpsc_sender = mpsc_sender.clone();
     return Some(thread::spawn(move || {
@@ -276,9 +351,6 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
             }
             .run();
 
-            if installed() {
-                return;
-            }
             mpsc_sender
                 .send(SetupMessage::Progress(format!(
                     "Retrying installation... (attempt {}/{})",
@@ -300,6 +372,37 @@ fn install_dependencies(options: &SetupOptions) -> StageOutput {
     }));
 }
 
+fn clear_pipewire_package_lock_for_install() {
+    let pacman_conf = Path::new(ARCH_FS_ROOT).join("etc/pacman.conf");
+    let content = match fs::read_to_string(&pacman_conf) {
+        Ok(content) => content,
+        Err(error) => {
+            log::warn!(
+                "Skipping PipeWire pacman unlock before install; failed to read {}: {error}",
+                pacman_conf.display()
+            );
+            return;
+        }
+    };
+
+}
+
+fn setup_pipewire_package_lock(_: &SetupOptions) -> StageOutput {
+    let pacman_conf = Path::new(ARCH_FS_ROOT).join("etc/pacman.conf");
+    let content = match fs::read_to_string(&pacman_conf) {
+        Ok(content) => content,
+        Err(error) => {
+            log::warn!(
+                "Skipping PipeWire pacman lock; failed to read {}: {error}",
+                pacman_conf.display()
+            );
+            return None;
+        }
+    };
+    
+    None
+}
+
 fn setup_firefox_config(_: &SetupOptions) -> StageOutput {
     // Create the Firefox root directory if it doesn't exist
     let firefox_root = format!("{}/usr/lib/firefox", ARCH_FS_ROOT);
@@ -312,6 +415,7 @@ fn setup_firefox_config(_: &SetupOptions) -> StageOutput {
     // Create autoconfig.js in defaults/pref
     let autoconfig_js = r#"pref("general.config.filename", "localdesktop.cfg");
 pref("general.config.obscure_value", 0);
+pref("general.config.sandbox_enabled", false);
 "#;
 
     let _ = fs::write(format!("{}/autoconfig.js", pref_dir), autoconfig_js)
@@ -321,6 +425,14 @@ pref("general.config.obscure_value", 0);
     let firefox_cfg = r#"// Auto updated by Local Desktop on each startup, do not edit manually
 defaultPref("media.cubeb.sandbox", false);
 defaultPref("security.sandbox.content.level", 0);
+defaultPref("media.allow-audio-non-utility", true);
+defaultPref("media.rdd-process.enabled", false);
+
+try {
+  var { SandboxUtils } = ChromeUtils.importESModule("resource://gre/modules/SandboxUtils.sys.mjs");
+  SandboxUtils.maybeWarnAboutDisabledContentSandbox = () => {};
+  SandboxUtils.observeContentSandboxPref = () => {};
+} catch (_) {}
 "#; // It is required that the first line of this file is a comment, even if you have nothing to comment. Docs: https://support.mozilla.org/en-US/kb/customizing-firefox-using-autoconfig
 
     let _ = fs::write(format!("{}/localdesktop.cfg", firefox_root), firefox_cfg)
@@ -469,60 +581,63 @@ exec "$@"
     None
 }
 
-fn setup_onboard_signal_fix(_: &SetupOptions) -> StageOutput {
+fn setup_chromium_no_sandbox(_: &SetupOptions) -> StageOutput {
     let fs_root = Path::new(ARCH_FS_ROOT);
-    let wrapper_path = fs_root.join("usr/local/bin/onboard");
 
-    // proot intercepts fstat() on socket fds and follows /proc/self/fd/N which points
-    // to "socket:[inode]" — not a real path. Python 3.14's signal.set_wakeup_fd()
-    // calls fstat(fd) to validate the wakeup socket, which fails with ENOENT under proot.
-    // We install a wrapper at /usr/local/bin/onboard (higher PATH priority than /usr/sbin)
-    // that monkey-patches signal.set_wakeup_fd to swallow OSError before launching the
-    // real Onboard binary.
-    let wrapper = r#"#!/usr/bin/python3
-# Onboard wrapper for proot/Android: patches signal.set_wakeup_fd to handle
-# OSError (ENOENT) caused by proot's fstat translation on socket file descriptors.
-import signal as _signal
-_orig_swf = _signal.set_wakeup_fd
-def _safe_swf(fd, **kwargs):
-    try:
-        return _orig_swf(fd, **kwargs)
-    except OSError:
-        return -1
-_signal.set_wakeup_fd = _safe_swf
+    // Chromium's sandbox needs CLONE_NEWUSER, which Android SELinux blocks, so every
+    // Chromium/Electron app has to be started with --no-sandbox. Electron apps pick that up
+    // from ELECTRON_DISABLE_SANDBOX (exported by startxfce4-localdesktop), but Chromium itself
+    // only takes the flag, and its desktop entry hardcodes an absolute path that a
+    // /usr/local/bin wrapper cannot intercept. So shadow the affected application entries in
+    // the user's own XDG directory, re-running every session to catch newly installed apps.
+    write_executable(
+        &fs_root.join("usr/local/bin/localdesktop-no-sandbox-entries"),
+        r#"#!/bin/sh
+target_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+mkdir -p "$target_dir" || exit 0
 
-import runpy, sys
-sys.argv[0] = '/usr/sbin/onboard'
-runpy.run_path('/usr/sbin/onboard', run_name='__main__')
-"#;
+for src in /usr/share/applications/*.desktop /usr/local/share/applications/*.desktop; do
+    [ -f "$src" ] || continue
 
-    let _ = fs::create_dir_all(
-        wrapper_path
-            .parent()
-            .expect("Failed to read onboard wrapper parent directory"),
+    prog=$(sed -n 's/^Exec=//p' "$src" | head -n1 | awk '{print $1}')
+    [ -n "$prog" ] || continue
+    case "$prog" in
+        /*) bin="$prog" ;;
+        *) bin=$(command -v "$prog" 2>/dev/null) || continue ;;
+    esac
+    bin=$(readlink -f "$bin" 2>/dev/null)
+    [ -n "$bin" ] || continue
+
+    # Every Chromium/Electron build ships the setuid sandbox helper next to its binary,
+    # or one level up when the launcher lives in a bin/ subdirectory.
+    dir=$(dirname "$bin")
+    [ -e "$dir/chrome-sandbox" ] || [ -e "$dir/../chrome-sandbox" ] || continue
+
+    dst="$target_dir/$(basename "$src")"
+    # Leave alone anything the user wrote themselves.
+    if [ -e "$dst" ] && ! grep -q '^X-LocalDesktop-NoSandbox=' "$dst"; then
+        continue
+    fi
+
+    awk '
+        /^\[Desktop Entry\]/ && !seen { print; print "X-LocalDesktop-NoSandbox=true"; seen = 1; next }
+        /^Exec=/ && !/--no-sandbox/ { sub(/^Exec=[^ ]+/, "& --no-sandbox") }
+        { print }
+    ' "$src" > "$dst"
+done
+"#,
     );
-    fs::write(&wrapper_path, wrapper).expect("Failed to write onboard wrapper");
-    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
-        .expect("Failed to mark onboard wrapper executable");
+
+    // Same flag for terminal launches, following the /usr/local/bin PATH-priority pattern.
+    write_executable(
+        &fs_root.join("usr/local/bin/chromium"),
+        r#"#!/bin/sh
+[ -x /usr/bin/chromium ] || { echo "chromium is not installed" >&2; exit 127; }
+exec /usr/bin/chromium --no-sandbox "$@"
+"#,
+    );
 
     None
-}
-
-fn chroot_home_dir(fs_root: &Path, username: &str) -> PathBuf {
-    if username == "root" {
-        fs_root.join("root")
-    } else {
-        fs_root.join(format!("home/{username}"))
-    }
-}
-
-fn write_executable(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(path, contents).expect("Failed to write executable script");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .expect("Failed to mark executable script");
 }
 
 fn read_android_density_dpi(android_app: AndroidApp) -> i32 {
@@ -566,297 +681,143 @@ fn android_ui_scale(density_dpi: i32) -> i32 {
     ((density_dpi as f32) / 160.0 * 1.1).max(1.0).round() as i32
 }
 
-fn setup_xfce_wayland(options: &SetupOptions) -> StageOutput {
-    let fs_root = Path::new(ARCH_FS_ROOT);
-    let username = get_application_context().local_config.user.username;
-    let home_dir = chroot_home_dir(fs_root, &username);
-    let labwc_dir = home_dir.join(".config/xfce4/labwc");
+fn chroot_home_dir(fs_root: &Path, username: &str) -> PathBuf {
+    if username == "root" {
+        fs_root.join("root")
+    } else {
+        fs_root.join(format!("home/{username}"))
+    }
+}
 
+fn write_executable(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(path, contents).expect("Failed to write executable script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("Failed to mark executable script");
+}
+
+// Sets up APT Policy to prevent services from starting during install.
+fn setup_apt_policy(_: &SetupOptions) -> StageOutput {
+    let fs_root = Path::new(ARCH_FS_ROOT);
+    let sbin = fs_root.join("usr/sbin");
+    let _ = fs::create_dir_all(&sbin);
+    write_executable(&sbin.join("policy-rc.d"), "#!/bin/sh\nexit 101\n");
+    None
+}
+
+// Sets up Lomiri Session script
+fn setup_lomiri_session(options: &SetupOptions) -> StageOutput {
+    let fs_root = Path::new(ARCH_FS_ROOT);
+    let bin_dir = fs_root.join("usr/local/bin");
+    let _ = fs::create_dir_all(&bin_dir);
+
+    // Read the Android density and compute the grid unit
     let density_dpi = read_android_density_dpi(options.android_app.clone());
     let ui_scale = android_ui_scale(density_dpi);
-    // Xft uses 96 as the default logical DPI; multiply by scale for HiDPI fonts.
-    let xft_dpi = ui_scale * 96;
+    let grid_unit = ui_scale * 16;
 
-    // Still useful for Xwayland clients started by labwc.
-    let xresources_path = home_dir.join(".Xresources");
-    let _ = fs::create_dir_all(
-        xresources_path
-            .parent()
-            .expect("Failed to read Xresources parent directory"),
-    );
-    upsert_kv_file(&xresources_path, ':', &[("Xft.dpi", xft_dpi.to_string())]);
+    write_executable(&bin_dir.join("androlomiri-session"), &format!(r#"#!/bin/bash
+mkdir -p /tmp/run /var/run/dbus /tmp/.X11-unix
+chmod 700 /tmp/run
+chmod 1777 /tmp/.X11-unix
+ln -sf /tmp/wayland-0 /tmp/run/wayland-0
 
-    // xfconf is read when xfce4-session starts; agent toggles must exist before launch
-    // (https://docs.xfce.org/xfce/xfce4-session/advanced — SSH and GPG Agents).
-    let xfconf_dir = home_dir.join(".config/xfce4/xfconf/xfce-perchannel-xml");
-    let _ = fs::create_dir_all(&xfconf_dir);
-    fs::write(
-        xfconf_dir.join("xfce4-session.xml"),
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+export XDG_RUNTIME_DIR=/tmp/run
+export MIR_SERVER_WAYLAND_HOST=wayland-0
+export XDG_SESSION_TYPE=wayland
+export GALLIUM_DRIVER=softpipe
+export QT_WAYLAND_DISABLE_WINDOWDECORATION=1
 
-<channel name="xfce4-session" version="1.0">
-  <property name="startup" type="empty">
-    <property name="ssh-agent" type="empty">
-      <property name="enabled" type="bool" value="false"/>
-    </property>
-    <property name="gpg-agent" type="empty">
-      <property name="enabled" type="bool" value="false"/>
-    </property>
-  </property>
-</channel>
-"#,
-    )
-    .expect("Failed to write xfce4-session xfconf defaults");
-    fs::write(
-        xfconf_dir.join("xsettings.xml"),
-        &format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+export LOMIRI_TESTING=1
+export DEVICEINFO_DEVICE_NAME=androlomiri
+export GRID_UNIT_PX={grid_unit}
 
-<channel name="xsettings" version="1.0">
-  <property name="Xft" type="empty">
-    <property name="DPI" type="int" value="{xft_dpi}"/>
-  </property>
-</channel>
-"#
-        ),
-    )
-    .expect("Failed to write xsettings xfconf defaults");
+export LD_PRELOAD=/usr/local/lib/libpoll_fix.so
 
-    // https://docs.xfce.org/xfce/getting-started — `startxfce4 --wayland` starts the
-    // session manager, panel, compositor (labwc), and desktop manager.
-    write_executable(
-        &fs_root.join("usr/local/bin/startxfce4-localdesktop"),
-        r#"#!/bin/sh
-exec startxfce4 --wayland "$@"
-"#,
-    );
+dbus-daemon --system --nofork --nopidfile > /tmp/dbus-system.log 2>&1 &
+sleep 1
 
-    // Runs from ~/.config/autostart once xfsettingsd is up; reinforces pre-seeded /Xft/DPI.
-    write_executable(
-        &fs_root.join("usr/local/bin/localdesktop-xfce-session-init"),
-        &format!(
-            r#"#!/bin/sh
-for _ in $(seq 1 50); do
-    xfconf-query -c xsettings -lv >/dev/null 2>&1 && break
-    sleep 0.1
-done
+/usr/lib/accountsservice/accounts-daemon > /tmp/accounts.log 2>&1 &
 
-xfconf-query -c xsettings -p /Xft/DPI -n -t int -s {xft_dpi} 2>/dev/null || \
-xfconf-query -c xsettings -p /Xft/DPI -t int -s {xft_dpi}
-"#
-        ),
-    );
-
-    let desktop_dir = home_dir.join("Desktop");
-    let _ = fs::create_dir_all(&desktop_dir);
-
-    // Desktop items are seeded create-if-missing (the run-once mechanism described
-    // on `StageOutput`): write only when absent, so we never clobber the user's
-    // edits or re-create on every launch. Deleting an item re-seeds it next launch,
-    // same as the rest of the managed environment.
-    let online_docs = desktop_dir.join("localdesktop-online-docs.desktop");
-    if !online_docs.exists() {
-        let _ = fs::write(
-            &online_docs,
-            format!(
-                r#"[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Local Desktop - Online Docs
-Comment=Open the Local Desktop documentation website
-Exec=firefox {DOCS_HOME_URL}
-Icon=firefox
-Terminal=false
-StartupNotify=true
-"#
-            ),
-        );
-    }
-    // Remove the launcher's former name so existing installs pick up the rename.
-    let _ = fs::remove_file(desktop_dir.join("localdesktop-documentation.desktop"));
-
-    // Open PDFs (e.g. the manual below) in Evince instead of Firefox. Create-if-missing
-    // so we don't stomp a user's own default-app choices.
-    let mimeapps = home_dir.join(".config/mimeapps.list");
-    if !mimeapps.exists() {
-        let _ = fs::write(
-            &mimeapps,
-            "[Default Applications]\napplication/pdf=org.gnome.Evince.desktop\n",
-        );
-    }
-
-    // Pre-download the matching offline User Manual (light, desktop size) onto the
-    // Desktop. Best-effort and off-thread so it never blocks setup; create-if-missing
-    // via the version in the filename. The on-disk name is human-friendly.
-    let version = crate::core::config::VERSION;
-    let manual_path = desktop_dir.join(format!("Local Desktop v{version} - User Manual.pdf"));
-    if !manual_path.exists() {
-        let url = crate::core::config::user_manual_url();
-        thread::spawn(move || {
-            if let Ok(response) = reqwest::blocking::get(&url) {
-                if let Ok(response) = response.error_for_status() {
-                    if let Ok(bytes) = response.bytes() {
-                        let _ = fs::write(&manual_path, &bytes);
-                    }
-                }
-            }
-        });
-    }
-
-    let autostart_dir = home_dir.join(".config/autostart");
-    let _ = fs::create_dir_all(&autostart_dir);
-
-    fs::write(
-        autostart_dir.join("localdesktop-xfce-session-init.desktop"),
-        r#"[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Local Desktop Xfce Session Init
-Comment=Apply HiDPI font scaling via xfsettings
-Exec=/usr/local/bin/localdesktop-xfce-session-init
-Terminal=false
-OnlyShowIn=XFCE;
-X-GNOME-Autostart-enabled=true
-"#,
-    )
-    .expect("Failed to write Xfce session init autostart entry");
-
-    // xfce4-power-manager expects host power interfaces that proot cannot provide.
-    fs::write(
-        autostart_dir.join("xfce4-power-manager.desktop"),
-        r#"[Desktop Entry]
-Type=Application
-Name=Power Manager
-Hidden=true
-OnlyShowIn=XFCE;
-"#,
-    )
-    .expect("Failed to disable xfce4-power-manager autostart");
-
-    let _ = fs::remove_file(autostart_dir.join("localdesktop-xfce-scale.desktop"));
-    let _ = fs::remove_file(autostart_dir.join("localdesktop-wlroots-output.desktop"));
-    let _ = fs::remove_file(fs_root.join("usr/local/bin/localdesktop-xfce-scale"));
-
-    // labwc runs wlr-randr from its autostart script once the compositor owns the output
-    // (labwc-config.5). Xfce stores labwc config under ~/.config/xfce4/labwc/.
-    //
-    // Host geometry is written to /tmp/localdesktop-output by the Android compositor before
-    // launch; the script waits for that file instead of applying a hardcoded fallback mode.
-    write_executable(
-        &fs_root.join("usr/local/bin/localdesktop-wlroots-output"),
-        &format!(
-            r#"#!/bin/sh
-# Keep labwc's wlroots output aligned with the Android host window.
-state_file="/tmp/localdesktop-output"
-lock_file="/tmp/localdesktop-wlroots-output.pid"
-fallback_scale="{ui_scale}"
-
-if [ -r "$lock_file" ]; then
-    old_pid=$(cat "$lock_file" 2>/dev/null)
-    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-        exit 0
-    fi
-fi
-echo "$$" > "$lock_file"
-trap 'rm -f "$lock_file"' EXIT INT TERM
-
-first_output() {{
-    wlr-randr 2>/dev/null | awk 'NF > 0 && $1 !~ /^Modes:/ && $1 !~ /^Current:/ && $1 !~ /^Position:/ && $1 !~ /^Transform:/ && $1 !~ /^Scale:/ {{ print $1; exit }}'
-}}
-
-read_output_state() {{
-    target_mode=""
-    target_scale="$fallback_scale"
-    if [ -r "$state_file" ]; then
-        . "$state_file"
-        target_mode="${{LOCALDESKTOP_OUTPUT_MODE:-}}"
-        target_scale="${{LOCALDESKTOP_OUTPUT_SCALE:-$target_scale}}"
-    fi
-    case "$target_mode" in
-        *x*) ;;
-        *) return 1 ;;
-    esac
-    case "$target_scale" in
-        ''|*[!0-9]*) target_scale="$fallback_scale" ;;
-    esac
-}}
-
-apply_output() {{
-    output="$1"
-    wlr-randr --output "$output" --custom-mode "${{target_mode}}@60Hz" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    wlr-randr --output "$output" --custom-mode "$target_mode" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    wlr-randr --output "$output" --mode "$target_mode" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    wlr-randr --output "$output" --scale "$target_scale" >/dev/null 2>&1 && return 0
-    return 1
-}}
-
-last_config=""
-while true; do
-    if ! read_output_state; then
-        sleep 0.2
-        continue
-    fi
-    output=$(first_output)
-    if [ -n "$output" ]; then
-        config="$output $target_mode $target_scale"
-        if [ "$config" != "$last_config" ] && apply_output "$output"; then
-            last_config="$config"
-        fi
-    fi
-    sleep 1
-done
-"#
-        ),
-    );
-
-    let _ = fs::create_dir_all(&labwc_dir);
-    // Nested on our compositor: reuse the parent wl_output mode when possible (labwc-config.5).
-    fs::write(
-        labwc_dir.join("rc.xml"),
-        r#"<?xml version="1.0"?>
-<labwc_config>
-  <core>
-    <reuseOutputMode>yes</reuseOutputMode>
-  </core>
-</labwc_config>
-"#,
-    )
-    .expect("Failed to write labwc rc.xml defaults");
-    write_executable(
-        &labwc_dir.join("autostart"),
-        r#"#!/bin/sh
-/usr/local/bin/localdesktop-wlroots-output >/tmp/localdesktop-wlroots-output.log 2>&1 &
-"#,
-    );
-
-    // Arch wiki: lock prevents startxfce4 from overwriting custom labwc environment.
-    // https://wiki.archlinux.org/title/Xfce#Using_labwc_custom_keymaps
-    fs::write(
-        labwc_dir.join("environment"),
-        "XDG_SESSION_TYPE=wayland\nXDG_CURRENT_DESKTOP=XFCE\n",
-    )
-    .expect("Failed to write labwc environment file");
-    fs::write(labwc_dir.join("lock"), "").expect("Failed to write labwc environment lock file");
-
-    let _ = fs::remove_file(home_dir.join(".config/labwc/autostart"));
+dbus-run-session /usr/bin/lomiri-session > /tmp/launch.log 2>&1
+echo "LOMIRI_EXIT_CODE=$?" >> /tmp/launch.log
+'
+"#));
 
     None
 }
-/// Writing a PulseAudio conf, so all application know where to direkt the stream
-/// This way it is agnostic to the Desktop Environment
-fn setup_pulse_client_conf(_: &SetupOptions) -> StageOutput {
+
+// Sets up poll() fix for Android
+// Required because Android's libc does not handle EINTR properly
+// poll() is badly implemented on Mir, making it not work on Android by default.
+fn setup_poll_fix(options: &SetupOptions) -> StageOutput {
     let fs_root = Path::new(ARCH_FS_ROOT);
-    let pulse_config_dir = fs_root.join("root/.config/pulse");
-    let _ = fs::create_dir_all(&pulse_config_dir);
-    let body = format!(
-        "# Local Desktop — host PulseAudio (written by setup, do not edit)\n\
-         default-server = {PULSE_GUEST_SERVER}\n\
-         autospawn = no\n"
-    );
-    fs::write(pulse_config_dir.join("client.conf"), body)
-        .expect("Failed to write pulse client.conf");
+    let poll_fix_so = fs_root.join("usr/local/lib/libpoll_fix.so");
+    if poll_fix_so.exists() {
+        return None;
+    }
+
+    let mpsc_sender = options.mpsc_sender.clone();
+    let poll_fix_src = fs_root.join("usr/local/src/poll_fix.c");
+    let _ = fs::create_dir_all(poll_fix_src.parent().unwrap());
+    fs::write(&poll_fix_src, r#"#define _GNU_SOURCE
+#include <poll.h>
+#include <errno.h>
+#include <dlfcn.h>
+typedef int (*poll_t)(struct pollfd *, nfds_t, int);
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    static poll_t real_poll = 0;
+    if (!real_poll) real_poll = (poll_t)dlsym(RTLD_NEXT, "poll");
+    int ret;
+    do { ret = real_poll(fds, nfds, timeout); } while (ret == -1 && errno == EINTR);
+    return ret;
+}
+"#).expect("Failed to write poll_fix.c");
+
+    Some(thread::spawn(move || {
+        ArchProcess {
+            command: "gcc -shared -fPIC /usr/local/src/poll_fix.c -o /usr/local/lib/libpoll_fix.so -ldl".into(),
+            user: None,
+            log: None,
+        }.run();
+    }))
+}
+
+// Setup Lomiri DeviceInfo properly
+fn setup_lomiri_deviceinfo(options: &SetupOptions) -> StageOutput {
+    let fs_root = Path::new(ARCH_FS_ROOT);
+    let density_dpi = read_android_density_dpi(options.android_app.clone());
+    let ui_scale = android_ui_scale(density_dpi);
+    let grid_unit = ui_scale * 16;
+
+    let deviceinfo_yaml = format!(r#"androlomiri:
+  Names:
+    - androlomiri
+  PrettyName: AndroLomiri
+  DeviceType: phone
+  GridUnit: {grid_unit}
+  SupportedOrientations:
+    - Portrait
+    - Landscape
+    - InvertedLandscape
+    - InvertedPortrait
+"#);
+
+    let deviceinfo_dir = fs_root.join("etc/deviceinfo");
+    let _ = fs::create_dir_all(&deviceinfo_dir);
+    fs::write(deviceinfo_dir.join("androlomiri.yaml"), &deviceinfo_yaml)
+        .expect("Failed to write androlomiri.yaml");
+    
+    let devices_dir = fs_root.join("etc/deviceinfo/devices");
+    let _ = fs::create_dir_all(&devices_dir);
+    fs::write(devices_dir.join("androlomiri.yaml"), deviceinfo_yaml)
+        .expect("Failed to write devices/androlomiri.yaml");
+
     None
 }
+
 fn fix_xkb_symlink(options: &SetupOptions) -> StageOutput {
     let fs_root = Path::new(ARCH_FS_ROOT);
     let xkb_path = fs_root.join("usr/share/X11/xkb");
@@ -867,7 +828,7 @@ fn fix_xkb_symlink(options: &SetupOptions) -> StageOutput {
             if let Ok(target) = fs::read_link(&xkb_path) {
                 if target.is_absolute() {
                     log::info!(
-                        "Absolute symlink target detected: {} -> {}. This is a problem because libxkbcommon is loaded in NDK, whose / is not Arch FS root!",
+                        "Absolute symlink target detected: {} -> {}. This is a problem because libxkbcommon is loaded in NDK, whose / is not Ubuntu FS root!",
                         xkb_path.display(),
                         target.display()
                     );
@@ -920,20 +881,24 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
     }
 
     let options = SetupOptions {
-        android_app,
+        android_app: android_app.clone(),
         mpsc_sender: sender.clone(),
     };
 
     let stages: Vec<SetupStage> = vec![
-        Box::new(setup_arch_fs),                // Step 1. Setup Arch FS (extract)
+        Box::new(setup_arch_fs),                // Step 1. Setup Ubuntu FS (extract)
         Box::new(simulate_linux_sysdata_stage), // Step 2. Simulate Linux system data
-        Box::new(install_dependencies),         // Step 3. Install dependencies
-        Box::new(setup_firefox_config),         // Step 4. Setup Firefox config
-        Box::new(setup_fake_bwrap), // Step 5. Replace bwrap with a no-sandbox shim (Android has no user namespaces)
-        Box::new(setup_onboard_signal_fix), // Step 6. Wrap Onboard to survive proot fstat/signal.set_wakeup_fd failure
-        Box::new(setup_xfce_wayland),       // Step 7. Setup Xfce Wayland launch and HiDPI scaling
-        Box::new(fix_xkb_symlink),          // Step 8. Fix xkb symlink
-        Box::new(setup_pulse_client_conf), // Step 9. Write PulseAudio conf (last)
+        Box::new(setup_apt_policy), // Step 3. Setup APT policy to prevent services from starting during install
+        Box::new(install_dependencies),         // Step 4. Install dependencies
+        Box::new(setup_machine_id),             // Step 5. Seed /etc/machine-id for D-Bus clients
+        Box::new(setup_pipewire_package_lock), // Step 6. Hold guest PipeWire packages for the Android-side PipeWire POC
+        Box::new(setup_firefox_config),        // Step 7. Setup Firefox config
+        Box::new(setup_fake_bwrap), // Step 8. Replace bwrap with a no-sandbox shim (Android has no user namespaces)
+        Box::new(setup_poll_fix), // Step 9. Setup poll() fix for Android
+        Box::new(setup_chromium_no_sandbox), // Step 10. Make Chromium/Electron apps launchable without a terminal
+        Box::new(setup_lomiri_session), // Step 11. Setup Lomiri session script
+        Box::new(setup_lomiri_deviceinfo), // Step 12. Setup Lomiri DeviceInfo properly
+        Box::new(fix_xkb_symlink),          // Step 13. Fix xkb symlink
     ];
 
     let handle_stage_error = |e: Box<dyn std::any::Any + Send>, sender: &Sender<SetupMessage>| {
@@ -1008,12 +973,16 @@ pub fn setup(android_app: AndroidApp) -> PolarBearBackend {
             graphic_renderer: None,
             clock: Clock::new(),
             key_counter: 0,
-            scale_factor: 1.0,
+            guest_scale_factor: scale_factor(&android_app),
             touch_points: std::collections::HashMap::new(),
             scroll_centroid: None,
-            touch_gesture_was_multi_touch: false,
+            touch_mode: TouchMode::Undecided,
             touch_down_position: None,
+            touch_down_time: None,
+            touch_slop_px: touch_slop_px(&android_app),
+            long_press_timeout_ms: long_press_timeout_ms(&android_app),
             pointer_pressed: false,
+            android_app,
         })
     } else {
         PolarBearBackend::WebView(WebviewBackend::build(receiver, progress))

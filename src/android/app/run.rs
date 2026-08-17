@@ -4,7 +4,7 @@ use super::build::{PolarBearApp, PolarBearBackend};
 use crate::android::{
     accessibility::{self, AppUserEvent},
     backend::{
-        pulse_server,
+        pipewire_standalone_aaudio,
         wayland::{
             bind, centralize, centralize_injected_keyboard, handle, write_guest_output_state,
             CentralizedEvent, State,
@@ -12,7 +12,10 @@ use crate::android::{
         webview::ErrorVariant,
     },
     proot::launch::launch,
-    utils::{ndk::run_in_jvm, webview::show_webview_popup},
+    utils::{
+        ndk::{self, run_in_jvm},
+        webview::show_webview_popup,
+    },
 };
 use crate::core::config;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -30,8 +33,11 @@ fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBacke
     };
 
     let window_size = winit.window_size();
-    let scale_factor = winit.scale_factor();
     let size = (window_size.w, window_size.h);
+    // Not `winit.scale_factor()`: that reads `AConfiguration`, which still reports the 160 dpi
+    // default on the first launch and only becomes accurate after a configuration change.
+    let guest_scale_factor = ndk::scale_factor(&backend.android_app);
+    backend.guest_scale_factor = guest_scale_factor;
     backend.compositor.state.size = size.into();
 
     let output = backend
@@ -39,12 +45,12 @@ fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBacke
         .output
         .get_or_insert_with(|| {
             Output::new(
-                "Local Desktop Wayland Compositor".into(),
+                "AndroLomiri Display".into(),
                 PhysicalProperties {
                     size: size.into(),
                     subpixel: Subpixel::HorizontalRgb,
-                    make: "Local Desktop".into(),
-                    model: config::VERSION.into(),
+                    make: "AndroLomiri".into(),
+                    model: "Compositor".into(),
                 },
             )
         })
@@ -61,11 +67,11 @@ fn configure_output(backend: &mut crate::android::backend::wayland::WaylandBacke
             refresh: 60000,
         }),
         Some(Transform::Normal),
-        Some(Scale::Fractional(scale_factor)),
+        Some(Scale::Integer(1)),
         Some((0, 0).into()),
     );
 
-    let guest_scale = scale_factor.round().max(1.0) as i32;
+    let guest_scale = guest_scale_factor.round().max(1.0) as i32;
     write_guest_output_state(window_size.w, window_size.h, guest_scale);
 
     for surface in backend.compositor.state.xdg_shell_state.toplevel_surfaces() {
@@ -128,8 +134,8 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
                 }
                 handle(CentralizedEvent::Redraw, backend, event_loop);
                 launch();
-                // Start the PulseAudio Server if Wayland is ready
-                pulse_server::spawn_after_ready(self.frontend.android_app.clone());
+                // Start the standalone-client PipeWire/AAudio backend.
+                pipewire_standalone_aaudio::spawn_after_ready(self.frontend.android_app.clone());
             }
         }
     }
@@ -180,13 +186,10 @@ impl ApplicationHandler<AppUserEvent> for PolarBearApp {
         if let PolarBearBackend::Wayland(backend) = &mut self.backend {
             backend.graphic_renderer = None;
             backend.key_counter = 0;
-            backend.touch_points.clear();
-            backend.scroll_centroid = None;
-            backend.touch_gesture_was_multi_touch = false;
-            backend.touch_down_position = None;
+            backend.reset_touch_state();
             backend.pointer_pressed = false;
-            // Kill PulseAudio Server if Wayland is suspended
-            pulse_server::shutdown();
+            // Kill the standalone-client PipeWire/AAudio backend if it was started.
+            pipewire_standalone_aaudio::shutdown();
         }
     }
 }

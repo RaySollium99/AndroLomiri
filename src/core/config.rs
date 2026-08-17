@@ -11,16 +11,15 @@ pub const ARCH_FS_ROOT: &str = "/data/data/app.polarbear/files/arch";
 #[cfg(test)]
 pub const ARCH_FS_ROOT: &str = "/data/local/tmp/arch";
 
-pub const ARCH_FS_ARCHIVE: &str = "https://github.com/termux/proot-distro/releases/download/v4.18.0/ubuntu-noble-aarch64-pd-v4.18.0.tar.xz";
+pub const ARCH_FS_ARCHIVE: &str = "https://androlomiri.sollium.net/files/ubuntu-resolute-aarch64-pd-v2.1.0.tar.xz";
 
 /// Project homepage, also the online documentation entry point.
-pub const DOCS_HOME_URL: &str = "https://localdesktop.github.io/";
+pub const DOCS_HOME_URL: &str = "https://androlomiri.sollium.net/";
 
-/// Download URL for the offline User Manual PDF matching the running version.
-/// The release asset is dot-free/hyphenated (GitHub turns spaces into dots).
+/// User manual downloa. Unused.
 pub fn user_manual_url() -> String {
     format!(
-        "https://github.com/localdesktop/localdesktop.github.io/releases/download/v{VERSION}/Local-Desktop-v{VERSION}-User-Manual.pdf"
+        "https://androlomiri.sollium.net/files/README.pdf"
     )
 }
 
@@ -30,8 +29,11 @@ pub const MAX_PANEL_LOG_ENTRIES: usize = 100;
 
 pub const SENTRY_DSN: &str = "https://d8af27f864ade027ff81ecadea91b02e@o4509548388417536.ingest.de.sentry.io/4509548392480848";
 
-/// PulseAudio Server Address and port
-pub const PULSE_GUEST_SERVER: &str = "tcp:127.0.0.1:14713";
+/// PipeWire runtime path as seen from inside the proot guest.
+pub const PIPEWIRE_GUEST_RUNTIME_DIR: &str = "/tmp";
+
+/// PipeWire-Pulse socket as seen from inside the proot guest.
+pub const PULSE_GUEST_SERVER: &str = "unix:/tmp/pulse/native";
 
 /// Make sure the config keys are all lowercase, and config values are single-line. Use \n for multi-line config values if needed
 /// If a key exists multiple time, the first entry is applied
@@ -76,29 +78,18 @@ pub struct CommandConfig {
 }
 
 fn default_check() -> String {
-    "dpkg -s gcc && dpkg -s fonts-noto-core && dpkg -s dpkg-dev && dpkg -s lomiri && dpkg -s lomiri-desktop-session && dpkg -s dbus-x11 && dpkg -s mir-graphics-drivers-desktop && dpkg -s click && dpkg -s labwc && dpkg -s wlr-randr && dpkg -s xdg-desktop-portal && dpkg -s xdg-desktop-portal-gtk && dpkg -s evince && dpkg -s pulseaudio && dpkg -s lomiri-wallpapers && dpkg -s accountsservice"
-    .to_string()
+    "dpkg -s gcc && dpkg -s deviceinfo-tools && dpkg -s fonts-noto-core && dpkg -s dpkg-dev && dpkg -s lomiri && dpkg -s lomiri-desktop-session && dpkg -s dbus-x11 && dpkg -s mir-graphics-drivers-desktop && dpkg -s labwc && dpkg -s wlr-randr && dpkg -s xdg-desktop-portal && dpkg -s xdg-desktop-portal-gtk && dpkg -s evince && dpkg -s lomiri-wallpapers && dpkg -s accountsservice"
+        .to_string()
 }
 
 fn default_install() -> String {
-    // Disgusting command, i am very well aware
-    // Needed because installing click on PRoot-Distro is broken.
-    // Workaround works so there's no need to do much for now
-    // Fixing this is on Canonical and UBports.
-    // (Tip: Add dpkg-dev to click's depedendencies to fix)
-    // That's on them, leave me alone - RaySollium99
-    "stdbuf -oL bash -c 'export DEBIAN_FRONTEND=noninteractive; echo -e \"#!/bin/sh\\nexit 101\" > /usr/sbin/policy-rc.d; chmod +x /usr/sbin/policy-rc.d; apt-get update; apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 full-upgrade; apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 install gcc dpkg-dev fonts-noto-core lomiri lomiri-desktop-session dbus-x11 mir-graphics-drivers-desktop labwc wlr-randr xdg-desktop-portal xdg-desktop-portal-gtk evince pulseaudio lomiri-wallpapers accountsservice'"
-    .to_string()
+    "stdbuf -oL bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 full-upgrade; apt-get -y -o Dpkg::Progress-Fancy=0 -o APT::Color=0 install gcc dpkg-dev deviceinfo-tools fonts-noto-core lomiri lomiri-desktop-session dbus-x11 mir-graphics-drivers-desktop labwc wlr-randr xdg-desktop-portal xdg-desktop-portal-gtk evince lomiri-wallpapers accountsservice'"
+        .to_string()
 }
 
 fn default_launch() -> String {
-    // Equally disgusting command, very well aware of that
-    // That whole C library is needed because Mir's `poll()` is broken on PROOT
-    // PKill/KillAll is needed because Android doesn't properly kill processes when you close the app
-    // I'll 1000% move this to `src/android/proot` for M3, for now we just want Lomiri booting which this command does
-    // Command and Fix is courtesy of The Slop Machine known as Gemini 3.1 Pro / Google Antigravity. - RaySollium99
-    format!("bash -c 'killall -9 dbus-daemon dbus-run-session lomiri accounts-daemon 2>/dev/null; pkill -9 dbus-daemon; pkill -9 dbus-run-session; pkill -9 lomiri; rm -rf /tmp/run /tmp/dbus-* /tmp/.X11-unix /var/run/dbus/* /run/dbus/* /var/run/user/*; export PULSE_SERVER={PULSE_GUEST_SERVER}; mkdir -p /tmp/run /var/run/dbus /tmp/.X11-unix; chmod 700 /tmp/run; chmod 1777 /tmp/.X11-unix; ln -sf /tmp/wayland-0 /tmp/run/wayland-0; export XDG_RUNTIME_DIR=/tmp/run; export MIR_SERVER_WAYLAND_HOST=wayland-0; export XDG_SESSION_TYPE=wayland; export GALLIUM_DRIVER=softpipe; export LOMIRI_TESTING=1; export QT_WAYLAND_DISABLE_WINDOWDECORATION=1; echo -e \"#define _GNU_SOURCE\\n#include <poll.h>\\n#include <errno.h>\\n#include <dlfcn.h>\\ntypedef int (*poll_t)(struct pollfd *, nfds_t, int);\\nint poll(struct pollfd *fds, nfds_t nfds, int timeout) {{ static poll_t real_poll = 0; if (!real_poll) real_poll = (poll_t)dlsym(RTLD_NEXT, \\\"poll\\\"); int ret; do {{ ret = real_poll(fds, nfds, timeout); }} while (ret == -1 && errno == EINTR); return ret; }}\" > /tmp/poll_fix.c; if [ ! -f /tmp/poll_fix.so ]; then gcc -shared -fPIC /tmp/poll_fix.c -o /tmp/poll_fix.so -ldl; fi; export LD_PRELOAD=/tmp/poll_fix.so; dbus-daemon --system --nofork --nopidfile > /tmp/dbus-system.log 2>&1 & sleep 1; /usr/lib/accountsservice/accounts-daemon > /tmp/accounts.log 2>&1 & dbus-run-session lomiri > /tmp/launch.log 2>&1; echo \"LOMIRI_EXIT_CODE=$?\" >> /tmp/launch.log'")
-    .to_string()
+    format!("export PIPEWIRE_RUNTIME_DIR={PIPEWIRE_GUEST_RUNTIME_DIR} PULSE_SERVER={PULSE_GUEST_SERVER}; /usr/local/bin/androlomiri-session")
+        .to_string()
 }
 
 impl Default for CommandConfig {
