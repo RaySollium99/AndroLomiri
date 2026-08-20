@@ -743,7 +743,6 @@ sleep 1
 
 dbus-run-session /usr/bin/lomiri-session > /tmp/launch.log 2>&1
 echo "LOMIRI_EXIT_CODE=$?" >> /tmp/launch.log
-'
 "#));
 
     None
